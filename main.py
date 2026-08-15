@@ -281,7 +281,7 @@ def valid_html_args(args):
 
 
 @app.post("/action-firewall")
-def action_firewall(payload):
+def action_firewall(payload: dict):
     # --------------------------------------------------------
     # 1. TOP-LEVEL SCHEMA
     # --------------------------------------------------------
