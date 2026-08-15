@@ -633,3 +633,472 @@ def terraform_plan(payload: dict):
         "decision": "approve",
         "reason": "APPROVE",
     }
+
+# ============================================================
+# Model Output Sanitization
+# ============================================================
+
+import re
+from html import unescape
+from urllib.parse import unquote, urlparse
+
+
+ALLOWED_EXTERNAL_HOSTS = {
+    "cdn-x67c0s9.example",
+    "app-3k95ovz.example",
+}
+
+SANITIZE_CHANNELS = {
+    "html",
+    "markdown",
+    "url",
+    "sql",
+    "shell",
+}
+
+
+def sanitize_result(safe, reason):
+    return {
+        "safe": safe,
+        "reason": reason,
+    }
+
+
+def decode_once(value):
+    """
+    Decode exactly once in this order:
+      1. percent escapes
+      2. HTML entities
+      3. \\uXXXX escapes
+    """
+
+    decoded = unquote(value)
+
+    # Only the entities explicitly specified by the question.
+    entity_map = {
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": '"',
+        "&apos;": "'",
+        "&amp;": "&",
+    }
+
+    # Numeric decimal entities: &#NN;
+    def numeric_decimal(match):
+        try:
+            return chr(int(match.group(1), 10))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    # Numeric hexadecimal entities: &#xNN;
+    def numeric_hex(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    decoded = re.sub(
+        r"&#([0-9]+);",
+        numeric_decimal,
+        decoded,
+    )
+
+    decoded = re.sub(
+        r"&#x([0-9a-fA-F]+);",
+        numeric_hex,
+        decoded,
+    )
+
+    for entity, replacement in entity_map.items():
+        decoded = decoded.replace(entity, replacement)
+
+    # Decode literal \uXXXX escapes once.
+    def unicode_escape(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    decoded = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        unicode_escape,
+        decoded,
+    )
+
+    return decoded
+
+
+def extract_urls(channel, output):
+    """
+    Extract URLs exactly according to the channel rules.
+    """
+
+    if channel == "html":
+        # Only quoted src= and href= attributes.
+        pattern = (
+            r"""(?:src|href)\s*=\s*["']([^"']*)["']"""
+        )
+        return re.findall(
+            pattern,
+            output,
+            flags=re.IGNORECASE,
+        )
+
+    if channel == "markdown":
+        # Target inside ](...)
+        pattern = r"""\]\(([^)]*)\)"""
+        matches = re.findall(pattern, output)
+
+        urls = []
+
+        for value in matches:
+            value = value.strip()
+
+            # Markdown destinations can optionally be surrounded
+            # by angle brackets.
+            if (
+                len(value) >= 2
+                and value[0] == "<"
+                and value[-1] == ">"
+            ):
+                value = value[1:-1]
+
+            # Remove optional title portion:
+            # (https://example "title")
+            if value:
+                if value.startswith(("http://", "https://", "//")):
+                    parts = value.split(None, 1)
+                    value = parts[0]
+
+            urls.append(value)
+
+        return urls
+
+    if channel == "url":
+        return [output.strip()]
+
+    return []
+
+
+def has_dangerous_scheme_text(output):
+    """
+    Detect javascript:, data:, vbscript:
+    with optional whitespace before the colon.
+    """
+
+    return bool(
+        re.search(
+            r"(?:javascript|data|vbscript)\s*:",
+            output,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def url_has_dangerous_scheme(url):
+    """
+    An extracted URL is dangerous if it has a scheme other than
+    http/https.
+
+    Relative URLs are allowed.
+    Protocol-relative URLs are treated as https.
+    """
+
+    value = url.strip()
+
+    if not value:
+        return False
+
+    # Protocol-relative URL: //host/path
+    if value.startswith("//"):
+        return False
+
+    parsed = urlparse(value)
+
+    if parsed.scheme:
+        return parsed.scheme.lower() not in {
+            "http",
+            "https",
+        }
+
+    return False
+
+
+def has_dangerous_scheme(channel, output):
+    if has_dangerous_scheme_text(output):
+        return True
+
+    for url in extract_urls(channel, output):
+        if url_has_dangerous_scheme(url):
+            return True
+
+    return False
+
+
+def has_external_exfil(channel, output):
+    """
+    Check absolute URLs only.
+
+    Allowed:
+      https://cdn-x67c0s9.example/path
+      https://app-3k95ovz.example/path
+
+    Not allowed:
+      https://evil.example
+      https://cdn-x67c0s9.example.attacker.example
+      https://attacker.example/?next=https://allowed.example
+      https://allowed@attacker.example/
+      //attacker.example/path
+    """
+
+    for url in extract_urls(channel, output):
+        value = url.strip()
+
+        if not value:
+            continue
+
+        # Protocol-relative references are absolute.
+        if value.startswith("//"):
+            parsed = urlparse("https:" + value)
+            hostname = parsed.hostname
+
+            if hostname not in ALLOWED_EXTERNAL_HOSTS:
+                return True
+
+            continue
+
+        parsed = urlparse(value)
+
+        # Relative reference.
+        if not parsed.scheme and not parsed.netloc:
+            continue
+
+        # Any non-http/https scheme is handled by
+        # DANGEROUS_SCHEME, not EXTERNAL_EXFIL.
+        if parsed.scheme.lower() not in {"http", "https"}:
+            continue
+
+        hostname = parsed.hostname
+
+        if hostname not in ALLOWED_EXTERNAL_HOSTS:
+            return True
+
+    return False
+
+
+def has_html_script_tag(output):
+    """
+    Opening script, iframe, object, or embed tag.
+    """
+
+    return bool(
+        re.search(
+            r"<\s*(?:script|iframe|object|embed)\b",
+            output,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def has_html_event_handler(output):
+    """
+    Detect on...= attributes, e.g.
+    onclick=
+    onload=
+    onerror=
+    """
+
+    return bool(
+        re.search(
+            r"\bon[a-zA-Z0-9_-]*\s*=",
+            output,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def has_sql_metachar(output):
+    if "'" in output:
+        return True
+
+    if '"' in output:
+        return True
+
+    if ";" in output:
+        return True
+
+    if "--" in output:
+        return True
+
+    if "/*" in output:
+        return True
+
+    if re.search(
+        r"\bunion\b",
+        output,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    if re.search(
+        r"\bor\s+1\s*=\s*1\b",
+        output,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def has_shell_metachar(output):
+    if any(char in output for char in ";&|`<>"):
+        return True
+
+    if "$(" in output:
+        return True
+
+    if "${" in output:
+        return True
+
+    return False
+
+
+def channel_violation(channel, output):
+    """
+    Apply channel rules in the specified order.
+    """
+
+    if channel == "html":
+        if has_html_script_tag(output):
+            return "SCRIPT_TAG"
+
+        if has_html_event_handler(output):
+            return "EVENT_HANDLER"
+
+        if has_dangerous_scheme(channel, output):
+            return "DANGEROUS_SCHEME"
+
+        if has_external_exfil(channel, output):
+            return "EXTERNAL_EXFIL"
+
+        return None
+
+    if channel == "markdown":
+        if has_dangerous_scheme(channel, output):
+            return "DANGEROUS_SCHEME"
+
+        if has_external_exfil(channel, output):
+            return "EXTERNAL_EXFIL"
+
+        return None
+
+    if channel == "url":
+        if has_dangerous_scheme(channel, output):
+            return "DANGEROUS_SCHEME"
+
+        if has_external_exfil(channel, output):
+            return "EXTERNAL_EXFIL"
+
+        return None
+
+    if channel == "sql":
+        if has_sql_metachar(output):
+            return "SQL_METACHAR"
+
+        return None
+
+    if channel == "shell":
+        if has_shell_metachar(output):
+            return "SHELL_METACHAR"
+
+        return None
+
+    return None
+
+
+@app.post("/sanitize-output")
+def sanitize_output(payload: dict):
+    # ========================================================
+    # 1. INVALID_SCHEMA
+    # ========================================================
+
+    if not isinstance(payload, dict):
+        return sanitize_result(
+            False,
+            "INVALID_SCHEMA",
+        )
+
+    if "channel" not in payload:
+        return sanitize_result(
+            False,
+            "INVALID_SCHEMA",
+        )
+
+    if "output" not in payload:
+        return sanitize_result(
+            False,
+            "INVALID_SCHEMA",
+        )
+
+    channel = payload["channel"]
+    output = payload["output"]
+
+    if channel not in SANITIZE_CHANNELS:
+        return sanitize_result(
+            False,
+            "INVALID_SCHEMA",
+        )
+
+    if not isinstance(output, str):
+        return sanitize_result(
+            False,
+            "INVALID_SCHEMA",
+        )
+
+    if len(output) > 20000:
+        return sanitize_result(
+            False,
+            "INVALID_SCHEMA",
+        )
+
+    # ========================================================
+    # 2. ENCODED_PAYLOAD
+    # ========================================================
+
+    decoded = decode_once(output)
+
+    if decoded != output:
+        decoded_violation = channel_violation(
+            channel,
+            decoded,
+        )
+
+        if decoded_violation is not None:
+            return sanitize_result(
+                False,
+                "ENCODED_PAYLOAD",
+            )
+
+    # ========================================================
+    # 3. ORIGINAL OUTPUT CHANNEL RULES
+    # ========================================================
+
+    violation = channel_violation(
+        channel,
+        output,
+    )
+
+    if violation is not None:
+        return sanitize_result(
+            False,
+            violation,
+        )
+
+    # ========================================================
+    # SAFE
+    # ========================================================
+
+    return sanitize_result(
+        True,
+        "SAFE",
+    )
