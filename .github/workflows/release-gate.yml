@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: TDS identity: 23f2000333@ds.study.iitm.ac.in
+      - name: "TDS identity: 23f2000333@ds.study.iitm.ac.in"
         run: echo "TDS identity: 23f2000333@ds.study.iitm.ac.in"
 
       - name: Checkout
@@ -61,7 +61,7 @@ jobs:
                       {
                           "owner": "thirdparty",
                           "name": "example",
-                          "ref": "0123456789abcdef0123456789abcdef0123456789"
+                          "ref": "0123456789abcdef0123456789abcdef01234567"
                       }
                   ]
               },
