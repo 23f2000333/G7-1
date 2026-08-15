@@ -1,0 +1,156 @@
+name: TDS GA7 Release Gate
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-release-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: TDS identity: 23f2000333@ds.study.iitm.ac.in
+        run: echo "TDS identity: 23f2000333@ds.study.iitm.ac.in"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start service
+        run: |
+          uvicorn main:app --host 127.0.0.1 --port 8000 &
+          sleep 3
+
+      - name: Test safe preview request
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          payload = {
+              "target": "preview",
+              "event": "pull_request",
+              "ref": "refs/heads/feature/test",
+              "workflow": {
+                  "trigger": "pull_request",
+                  "permissions": {
+                      "contents": "read",
+                      "packages": "write",
+                      "id-token": "none"
+                  },
+                  "testsPassed": True,
+                  "matrixComplete": True,
+                  "failFast": False,
+                  "actions": [
+                      {
+                          "owner": "actions",
+                          "name": "checkout",
+                          "ref": "v4"
+                      },
+                      {
+                          "owner": "thirdparty",
+                          "name": "example",
+                          "ref": "0123456789abcdef0123456789abcdef0123456789"
+                      }
+                  ]
+              },
+              "image": {
+                  "multiStage": True,
+                  "runsAsRoot": False,
+                  "secretMode": "none",
+                  "criticalVulnerabilities": 0,
+                  "digestPinned": True
+              }
+          }
+
+          request = urllib.request.Request(
+              "http://127.0.0.1:8000/release-gate",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request) as response:
+              result = json.load(response)
+
+          print(result)
+
+          assert result["decision"] == "promote"
+          assert result["violations"] == []
+          PY
+
+      - name: Test unsafe request
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          payload = {
+              "target": "preview",
+              "event": "pull_request",
+              "ref": "refs/heads/test",
+              "workflow": {
+                  "trigger": "pull_request_target",
+                  "permissions": {
+                      "contents": "write",
+                      "packages": "write",
+                      "id-token": "none"
+                  },
+                  "testsPassed": False,
+                  "matrixComplete": False,
+                  "failFast": True,
+                  "actions": [
+                      {
+                          "owner": "someone",
+                          "name": "bad-action",
+                          "ref": "v1"
+                      }
+                  ]
+              },
+              "image": {
+                  "multiStage": False,
+                  "runsAsRoot": True,
+                  "secretMode": "copy",
+                  "criticalVulnerabilities": 2,
+                  "digestPinned": False
+              }
+          }
+
+          request = urllib.request.Request(
+              "http://127.0.0.1:8000/release-gate",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request) as response:
+              result = json.load(response)
+
+          print(result)
+
+          expected = {
+              "EXCESS_PERMISSION",
+              "UNSAFE_PR_TRIGGER",
+              "TESTS_INCOMPLETE",
+              "MUTABLE_ACTION",
+              "SINGLE_STAGE_IMAGE",
+              "ROOT_RUNTIME",
+              "SECRET_IN_LAYER",
+              "CRITICAL_CVE",
+              "UNPINNED_IMAGE",
+          }
+
+          assert result["decision"] == "block"
+          assert set(result["violations"]) == expected
+          PY
